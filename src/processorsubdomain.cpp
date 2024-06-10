@@ -204,7 +204,7 @@ class ProcessorSubdomain{
    
         for (int i = 0; i < 26; i++){
             std::vector<IDPOSITION> ghost_particles = this->gather_ghost_particles(i);
-            communication[this->subdomain_id][this->neighbouring_subdomains[i]] = ghost_particles;
+            this->communication.set_forward_communication_data(this->subdomain_id, this->neighbouring_subdomains[i],  ghost_particles)
         }
 
 
@@ -312,5 +312,20 @@ class ProcessorSubdomain{
 
 
         }
+
+
+        // Force calculations
+        void calculate_forces(){
+
+
+
+
+
+
+
+            
+        }
+
+
 }
 
