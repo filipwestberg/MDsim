@@ -9,6 +9,10 @@
 #include <vector>
 #include <array>
 #include <queue>
+#include <unordered_map>
+#include <unordered_set>
+#include <omp.h>
+#include <map>
 #include <processorsubdomain.hpp>
 
 // The configuration object keeping track of the current configuration
@@ -25,6 +29,7 @@ struct ij_pair
 int i, j;
 ij_pair(int i, int j) : i(i), j(j) {}
 };
+
 
 class ProcessorSubdomain{
     // TODO : particle information only in cell grid
@@ -80,7 +85,9 @@ class ProcessorSubdomain{
         // Ghost particles can then efficiently be included during the building of the neighbour lists.
     
         // Global particle ids
-        std::vector<int> global_particle_ids;
+        std::map<int, int> global_local_particle_ids_map;
+        std::map<int, int> local_global_particle_ids_map;
+        std::vector<int> global_particle_ids_vector;
 
         // Neighbouring subdomains
         std::array<int, 26> neighbouring_subdomains;
@@ -94,10 +101,11 @@ class ProcessorSubdomain{
         std::vector<std::array<double, 3>> ghost_positions;
         
         // Cell lists 
-        std::vector<int> cell_list_id;      // Cell id of each particle
+        std::vector<int> cell_list_id;                             // Cell id of each particle
         std::vector<std::array<int, 26>> neighbouring_cells;       // Each cell keeps the ids of its neighbours
         std::array<int , this->no_cells> cell_list_particle_no;    // Number of particles in each cell
         std::array<std::vector <int>, this->no_cells> cell_lists;  // Particles in each cell
+        std::array<std::vector<std::array<int, 3>>, this->no_cells> cell_list_pos; // Particle positions in each cell
 
         // Neighlists, cell grid, ghost atoms, ghost cells, ghost subdomains
         std::vector<std::tuple<int, int>> neighbour_list_info;     // Neighbour list of tuples (offset, number of neighbours)
@@ -272,7 +280,13 @@ class ProcessorSubdomain{
 
     private:
 
+        
+        // ---------------------------------- Initialization --------------------------------
+        {
         void initial_init(){
+            // Map global -> local and local -> global particles
+            init_particle_mapping();
+
             // Cell grid
             init_neighbouring_cell_lists();
             build_cell_lists();
@@ -287,10 +301,16 @@ class ProcessorSubdomain{
         }
 
 
-
-
+        void init_particle_mapping(){
+            // Initialize the global -> local and local -> global particle mappings from the global particle id vector given at construction
+            for (int i = 0; i < this->no_particles; i++){
+                this->global_local_particle_ids_map[this->global_particle_ids_vector[i]] = i;
+                this->local_global_particle_ids_map[i] = this->global_particle_ids_vector[i];
+            }
+        }
+        }
         // ---------------------------------- Cell grid initialization and management --------------------------------
-
+        {
         void init_neighbouring_cell_list(){
             // Initialize the empty neighbour list
             this->neighbour_list.clear();
@@ -300,6 +320,8 @@ class ProcessorSubdomain{
             this->cell_lists = std::vector<std::vector<int>>(this->no_cells, std::vector<int>());
             this->cell_list_id = std::vector<int>(this->no_particles, 0);
             this->cell_list_particle_no = std::vector<int>(this->no_cells, 0);
+            // Initialize the empty positions cell lists
+            this->cell_list = std::vector<std::vector<int>>(this->no_cells, std::vector<int>());
         }
         void build_neighbouring_cell_lists(){
             // Initialize the neighbouring cell lists of increasing i, j, k (templating to reduce memory usage)
@@ -325,10 +347,19 @@ class ProcessorSubdomain{
             }
 
         }
-
         void build_cell_lists(){
+            // Build the cell lists from the previous cell lists
+            // Iterate over the particles
+            int lid;
+            for (int i = 0; i < this->no_particles; i++){
+                lid = this->pos_to_linear_cell_id(this->positions[i]);
+            }
+        }
+
+        void init_cell_lists(){
             // Initialize the cell lists id for each particle, count number of particles in each cell and build cell lists
             // Initialize an empty int vector
+            // Cell lists are built from the original positions array passed from configuration
             
             int lid = 0; 
             for (int i = 0; i < this->no_particles; i++){
@@ -351,7 +382,7 @@ class ProcessorSubdomain{
              * @throws None
              */
             if (pos[0] < this->xgl || pos[1] < this->ylg || pos[2] < this->zlg){
-                std::cerr << "Position out of bounds" << std::endl;
+                std::cerr << "Position out of bounds of subdomain, including ghost cells" << std::endl;
                 exit(1);
             }
 
@@ -368,13 +399,14 @@ class ProcessorSubdomain{
 
             return n*(k + n*(j + n*i));
         }
-
+        }
         // ---------------------------------- Neighbor list initialization and management --------------------------------
+        {
         void init_neighbour_list(){
             // Initialize the empty neighbour list
             this->neighbour_list = std::vector<ij_pair>(this->no_particles, 0);
         }
-        
+
         void check_neighbours(const std::vector<int>& particle_ids1, const std::vector<int>& particle_ids2){
             // Given the ids in the cell lists of two particles, check if there are any neighbours and if so add them to the neighbour list
             std::array<double, 3> pos1;
@@ -412,8 +444,9 @@ class ProcessorSubdomain{
             }
         }
 
-
+        }
         //----------------------------------- Force calculations -----------------------------------
+        {
         void force_sweep(){
             // Calculate forces on all particles in the subdomain
             // Iterate over the neighbour list
@@ -501,7 +534,7 @@ class ProcessorSubdomain{
         double Hooke(std::array<double, 3> pos1, std::array<double, 3> pos2){
             return 0.0;
         }
-
+        }
         // ------------------------------ Time integration -------------------------------
         void update_positions(double dt){
             // Verlet integrate the positions
@@ -514,6 +547,20 @@ class ProcessorSubdomain{
         // ------------------------------ Communication -------------------------------
         void unpack_ghost_particles(){
             // Unpack a subdomain's ghost particles into the cell lists
+            // Messages are vector of IDPOSITION structs
+            // Read the messages in the communication object
+            // Iterate over neighbouring subdomains
+            int3double idpos;
+            int local_id; 
+            int global_id; 
+            for (int j : this->neighbouring_subdomains){
+                // Iterate over the message array, read the id and position and set the elements of the position array based on the global id
+                for (int k = 0; k < this->communication.get_forward_communication_data(this->subdomain_id, j).size(); k++){
+                    idpos = this->communication.get_forward_communication_data(this->subdomain_id, j)[k];
+                    
+                }
+            }
+            // Add the ghost particles to the cell lists
         }
 
         // ------------------------------ Auxillary functions -------------------------------
