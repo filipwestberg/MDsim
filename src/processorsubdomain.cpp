@@ -17,17 +17,24 @@
 
 // The configuration object keeping track of the current configuration
 // of the program.
-
-struct int3double
+// TODO : 
+//          Move force functions and binding etc to configuration and pass a lambda to this class
+//          Periodicity of the system, movement and neighborship
+//          Coherency of all structures (id, ghost_comm_array etc).
+//          Ghost cutoff as variable
+//          Identify particles shifting subdomain
+//          Incorporate particles shifting subdomain
+struct int3double    
 {
     int id;
     double position[3];
+    int3double(int id, double position[3]) : id(id), position(position) {}
 };
 
 struct ij_pair
 {
-int i, j;
-ij_pair(int i, int j) : i(i), j(j) {}
+    int i, j;
+    ij_pair(int i, int j) : i(i), j(j) {}
 };
 
 
@@ -40,32 +47,32 @@ class ProcessorSubdomain{
 
         // Nos
         int no_particles; 
+        int no_local_particles; 
         int no_ghost_particles;
+        int no_ghost_particles_others; 
         int no_subdivisions; 
+        int no_subdivisions_ghosts; 
         int no_cells; 
+        int no_cells_ghosts;
 
         // Dimensions
-        double xl; 
-        double yl; 
-        double zl; 
-        double xu; 
-        double yu; 
-        double zu;
+        double bounds[6];
 
+        double cell_length;
         double side_length;
-        // Dimensions when including ghost cells
-        double xlg; 
-        double ylg; 
-        double zlg; 
-        double xug; 
-        double yug; 
-        double zug;
 
-        double side_length_ghosts; 
+        // Midpoint
+        double xmid;
+        double ymid;
+        double zmid;
 
         // Neighbour settings
         double neighbour_cutoff;
         double neighbour_cutoff_squared;
+
+        // Misc.
+        int iteration = 0; // Current iteration
+        double ghost_cutoff; // Cutoff for ghost particles
 
         bool comm_forward; 
         Communication communication; // TODO add pointer to this shared object
@@ -84,22 +91,21 @@ class ProcessorSubdomain{
         // When particles migrate into another domain, they migrate into the cells inside of the outermost shell. They are naturally incorporated into the subdomain.
         // Ghost particles can then efficiently be included during the building of the neighbour lists.
     
-        // Global particle ids
+        // Global particle ids for in domain particles and ghost particles
         std::map<int, int> global_local_particle_ids_map;
         std::map<int, int> local_global_particle_ids_map;
-        std::vector<int> global_particle_ids_vector;
+        std::map<int, int> global_local_ghost_particle_ids_map;
+        std::map<int, int> local_global_ghost_particle_ids_map;
+
+        std::vector<int> global_particle_ids_vector;        // Initial global particle ids for in domain particles
 
         // Neighbouring subdomains
-        std::array<int, 26> neighbouring_subdomains;
-        std::array<std::array<int, 6>, 26> subdomain_cell_loop_limits;
+        std::array<int, 6> neighbouring_subdomains;
 
         // Particle positions, velocities etc. passed from the overarching configuration object
         std::vector<std::array<double, 3>> positions;
         std::vector<std::array<double, 3>> velocities;
 
-        // Ghost particles
-        std::vector<std::array<double, 3>> ghost_positions;
-        
         // Cell lists 
         std::vector<int> cell_list_id;                             // Cell id of each particle
         std::vector<std::array<int, 26>> neighbouring_cells;       // Each cell keeps the ids of its neighbours
@@ -108,19 +114,41 @@ class ProcessorSubdomain{
         std::array<std::vector<std::array<int, 3>>, this->no_cells> cell_list_pos; // Particle positions in each cell
 
         // Neighlists, cell grid, ghost atoms, ghost cells, ghost subdomains
-        std::vector<std::tuple<int, int>> neighbour_list_info;     // Neighbour list of tuples (offset, number of neighbours)
         std::vector<ij_pair> neighbour_list;                       // Neighbour list of particle id pairs indicating neighborship
+        std::vector<ij_pair> ghost_neighbour_list;                // Neighbour list of ghost particle id pairs indicating neighborship
+
+        // Movement array
+        std::vector<double> accumulated_movement;
+
+        // Communication arrays 
+        std::array<std::vector<int3double> , 6> forward_communication_data;
+        std::array<std::vector<int3double> , 6> backward_communication_data;
+        std::vector<bool> ghost_comm_array;
+
+        // Flags
+        bool initialized = false;
+        bool dump_data = false; 
+        bool rebuild_neighbours = false;
+
+        // Removal queue
+        std::vector<int> removal_queue;
+
+        // Reordering queue (local particle ids that are to be moved either into or out of the ghost particle subarray)
+        std::vector<int> reordering_queue;
+
+        // Keep track of ghost particles that need to be removed by a map of global particle ids and bools
+        std::map<bool> ghost_particle_removal_map;
+
+        // Ghost position queue
+        std::queue<int3double> ghost_addition_queue;
+
+
 
         ProcessorSubdomain(int processor_id, 
                             int subdomain_id, 
                             int no_particles, 
                             int no_cells, 
-                            double xl, 
-                            double yl, 
-                            double zl, 
-                            double xu, 
-                            double yu, 
-                            double zu, 
+                            double bounds[6], 
                             double side_length, 
                             std::array<int, 26> neighbouring_subdomains,
                              
@@ -131,172 +159,74 @@ class ProcessorSubdomain{
             this->subdomain_id = subdomain_id;
             this->no_particles = no_particles;
             this->no_ghost_particles = 0;
-            this->no_subdivisions = no_subdivisions + 2;
-            this->no_cells = (this-> no_subdivisions)^3;
 
-            this->xl = xl;
-            this->yl = yl;
-            this->zl = zl;
-            this->xu = xu;
-            this->yu = yu;
-            this->zu = zu;
+            this->no_subdivisions = no_subdivisions;
+            this->no_subdivisions_ghosts = no_subdivisions + 2;
+            this->no_cells = std::pow(this->no_subdivisions, 3);
+            this->no_cells_ghosts = std::pow(this->no_subdivisions_ghosts, 3);
+
+            this->bounds = bounds;
 
             this->side_length = side_length;
             this->neighbouring_subdomains = neighbouring_subdomains;
-            this->cell_list_particle_no = std::array<int, this->no_cells>(0);
             this->communication = communication;
-
-            // Initialize structures, TODO : move to constructor, look over
-            this->cell_lists = std::array<std::vector <int>;
-            this->neighbouring_cells = std::array<std::array<int, 26>;
-            this->no_cells>(std::vector <int> (0));
-            this->neighbour_list = std::vector<ij_pair>(0);
-            this->neighbour_list_info = std::vector<std::tuple<int, int>>(0);
-            this->cell_list_id = std::vector<int>(0);
-            this->subdomain_cell_loop_limits = std::array<std::array<int, 6>, 26>(std::array<int, 6>(0));   
-            this->cell_lists = std::array<std::vector<int>, this->no_cells>(std::vector<int>(0));
-            this->neighbouring_cells = std::array<std::array<int, 26>, this->no_cells>(std::array<int, 26>(0));
-
-
         }
-
-
-    std::vector <int> get_cell_lists_boundary(int boundary_id){
-        // Get the cell lists at the boundary according to the boundary number, with numbers ordered according to 
-        std::vector <int> boundary_cell_lists;
-
-        // Boundary sets start and end values of loop
-        int istart = this->subdomain_cell_loop_limits[boundary_id][0];
-        int iend = this->subdomain_cell_loop_limits[boundary_id][1];
-        int jstart = this->subdomain_cell_loop_limits[boundary_id][2];
-        int jend = this->subdomain_cell_loop_limits[boundary_id][3];
-        int kstart = this->subdomain_cell_loop_limits[boundary_id][4];
-        int kend = this->subdomain_cell_loop_limits[boundary_id][5];
-
-        // Loop over the boundary sets
-        for (int i = istart; i < iend; i++){
-            for (int j = jstart; j < jend; j++){
-                for (int k = kstart; k < kend; k++){
-                    boundary_cell_lists.push_back(this->cell_lists[i][j][k]);
-                }
-            }
-        }
-
-        return boundary_cell_lists;
-
-        
-    }
-
-
-    void set_boundary_loop_limits() {
-        int n = this->no_subdivisions;
-        this->subdomain_cell_loop_limits[0] = {0, 1, 0, n, 0, n};        // lower X
-        this->subdomain_cell_loop_limits[1] = {n-1, n, 0, n, 0, n};      // upper X
-        this->subdomain_cell_loop_limits[2] = {0, n, 0, 1, 0, n};        // lower Y
-        this->subdomain_cell_loop_limits[3] = {0, n, n-1, n, 0, n};      // upper Y
-        this->subdomain_cell_loop_limits[4] = {0, n, 0, n, 0, 1};        // lower Z
-        this->subdomain_cell_loop_limits[5] = {0, n, 0, n, n-1, n};      // upper Z
-
-        // Diagonal boundaries
-
-        // Lower X, lower Y diagonals
-        this->subdomain_cell_loop_limits[6] = {0, 1, 0, 1, 0, n};        // (0, 0, z)
-        this->subdomain_cell_loop_limits[7] = {0, 1, n-1, n, 0, n};      // (0, n-1, z)
-        this->subdomain_cell_loop_limits[8] = {0, 1, 0, n, 0, 1};        // (0, y, 0)
-        this->subdomain_cell_loop_limits[9] = {0, 1, 0, n, n-1, n};      // (0, y, n-1)
-
-        // Upper X, lower Y diagonals
-        this->subdomain_cell_loop_limits[10] = {n-1, n, 0, 1, 0, n};     // (n-1, 0, z)
-        this->subdomain_cell_loop_limits[11] = {n-1, n, n-1, n, 0, n};   // (n-1, n-1, z)
-        this->subdomain_cell_loop_limits[12] = {n-1, n, 0, n, 0, 1};     // (n-1, y, 0)
-        this->subdomain_cell_loop_limits[13] = {n-1, n, 0, n, n-1, n};   // (n-1, y, n-1)
-
-        // Lower X, upper Y diagonals
-        this->subdomain_cell_loop_limits[14] = {0, 1, n-1, n, 0, n};     // (0, n-1, z)
-        this->subdomain_cell_loop_limits[15] = {0, 1, 0, 1, 0, n};       // (0, 0, z)
-        this->subdomain_cell_loop_limits[16] = {0, 1, 0, n, 0, 1};       // (0, y, 0)
-        this->subdomain_cell_loop_limits[17] = {0, 1, 0, n, n-1, n};     // (0, y, n-1)
-
-        // Upper X, upper Y diagonals
-        this->subdomain_cell_loop_limits[18] = {n-1, n, n-1, n, 0, n};   // (n-1, n-1, z)
-        this->subdomain_cell_loop_limits[19] = {n-1, n, 0, 1, 0, n};     // (n-1, 0, z)
-        this->subdomain_cell_loop_limits[20] = {n-1, n, 0, n, 0, 1};     // (n-1, y, 0)
-        this->subdomain_cell_loop_limits[21] = {n-1, n, 0, n, n-1, n};   // (n-1, y, n-1)
-
-        // Lower Z diagonals
-        this->subdomain_cell_loop_limits[22] = {0, 1, 0, n, 0, 1};       // lower Z plane, lower X
-        this->subdomain_cell_loop_limits[23] = {n-1, n, 0, n, 0, 1};     // lower Z plane, upper X
-
-        // Upper Z diagonals
-        this->subdomain_cell_loop_limits[24] = {0, 1, 0, n, n-1, n};     // upper Z plane, lower X
-        this->subdomain_cell_loop_limits[25] = {n-1, n, 0, n, n-1, n};   // upper Z plane, upper X
-}
-
-    std::vector<IDPOSITION> gather_ghost_particles(int subdomain_id){
-        std::vector<int> boundary_cell_lists = this->get_cell_lists_boundary(subdomain_id);
-        no_cells = boundary_cell_lists.size();
-
-        // Subdomain variables
-        int no_ghost_particles = 0; 
-        int idx = 0;
-
-        // Loop over each cell adding them to the ghost list, but first calculate the number of particles to be communicated to preallocate the required array
-        for (int j = 0; j < no_cells; j++){
-            no_ghost_particles += this->cell_list_particle_no[boundary_cell_lists[j]];
-        }
-        // Preallocate the array of IDPOS pairs
-        std::vector<IDPOSITION> ghost_particles(no_ghost_particles);
-        for (int j = 0; j < no_cells; j++){
-            for (int k = 0; k < this->cell_list_particle_no[boundary_cell_lists[j]]; k++){
-                ghost_particles[idx].id = this->cell_list[boundary_cell_lists[j]][k];
-                ghost_particles[idx].position = this->positions[this->cell_list[boundary_cell_lists[j]][k]];
-                idx++;
-            }
-        }
-
-        return ghost_particles;
-        
-    }
-
-    void forward_communication(){
-        // Forward communicate ghost atoms to surrounding subdomains
-        // Loop over each neighbouring subdomain
-        std::vector <int> boundary_cell_lists;
-   
-        for (int i = 0; i < 26; i++){
-            std::vector<IDPOSITION> ghost_particles = this->gather_ghost_particles(i);
-            this->communication.set_forward_communication_data(this->subdomain_id, this->neighbouring_subdomains[i],  ghost_particles)
-        }
-
-
-    }
-
-    void backward_communication(){
-        // Backwards communicate force calculations on ghost atoms
-    }
-
-
-
 
     private:
+        // ------------------------------- Iteration ------------------------------------------------
+        // Over the previous timestep already known ghost particles have moved, and have either been introduced or removed from the set of ghost particles.
+        // In domain particles have moved and have either been introduced or removed from the set of ghost particles in other domains.
+        // In domain particles may have moved into another domain.
+        // 
+        // Iterate the subdomain one step by : 
+        // 1. Unpacking ghost particles:
+        //                               1.a) add ghost particles onto the ghost positions array
+        //                               1.b) move ghost particles
+        //                               1.c) remove ghost particles from the ghost particle array that have not been communicated this timestep
+        //                               1.d) particles that have moved across the boundary are to be added into the local position array 
+        // 2. Check the integrity of the particle positions array
+        // 3. Rebuild the neighbouring lists if necessary
+        // 4. Force calculation
+        // 5. Integrate
+        // 6. Communicate forward ghost particles (this includes genuine ghost particles and particles that have moved across the boundary)
 
+
+
+        void iterate(){
+            // Unpack ghost particles
+            this->unpack_ghost_particles();
+
+            // Rebuild neighbour lists
+            this->build_neighbour_lists();
+
+            // Force calculation
+            this->force_sweep();
+
+            // Integrate
+            this->update_positions();
+
+            // Communicate forward ghost particles
+            this->communicate_ghost_particles();
+
+            
+
+        }
         
         // ---------------------------------- Initialization --------------------------------
         {
         void initial_init(){
-            // Map global -> local and local -> global particles
+
             init_particle_mapping();
 
             // Cell grid
             init_neighbouring_cell_lists();
-            build_cell_lists();
+
             build_neighbouring_cell_lists();
             init_cell_grid();
             sort_by_cell_id();
 
             // Neighbour list
             init_neighbour_list();
-            build_neighbour_lists();
 
         }
 
@@ -309,66 +239,69 @@ class ProcessorSubdomain{
             }
         }
         }
+    
         // ---------------------------------- Cell grid initialization and management --------------------------------
         {
-        void init_neighbouring_cell_list(){
+        // Initialize the :
+        //                     - empty neighbour list
+        //                     - empty cell lists
+        //                     - empty positions array
+        //                     - empty communication arrays
+        //                     - empty neighbouring cell lists
+
+        void initializations(){
+            // Initialize the empty forward and backward communication arrays
+            for (int i = 0; i < 6; i++){
+                this->forward_communication_data[i] = std::vector<int3double>();
+                this->backward_communication_data[i] = std::vector<int3double>();
+            }
+
+            // Initialize the empty ghost communication array
+            this->ghost_comm_array = std::vector<bool>;
+
             // Initialize the empty neighbour list
-            this->neighbour_list.clear();
-        }
-        void init_cell_lists(){
-            // Initialize the empty neighbour lists for each cell
-            this->cell_lists = std::vector<std::vector<int>>(this->no_cells, std::vector<int>());
-            this->cell_list_id = std::vector<int>(this->no_particles, 0);
-            this->cell_list_particle_no = std::vector<int>(this->no_cells, 0);
-            // Initialize the empty positions cell lists
-            this->cell_list = std::vector<std::vector<int>>(this->no_cells, std::vector<int>());
-        }
-        void build_neighbouring_cell_lists(){
-            // Initialize the neighbouring cell lists of increasing i, j, k (templating to reduce memory usage)
-            std::tuple<int, int, int> current_cell_id;
-            int lid; 
+            this->neighbour_list = std::vector<ij_pair>;
+            this->ghost_neighbour_list = std::vector<ij_pair>;
 
-            for (int i = 0; i < this->no_cells; i++){
-                current_cell_id = this->linear_cell_id_to_pos(i);
-                for (int j = 0; j < 1; j++){
-                    for (int k = 0; k < 1; k++){
-                        for (int l = 0; l < 1; l++){
-                            if (j == 0 && k == 0 && l == 0){
-                                continue;
-                            } else{
-                                lid = this->pos_to_linear_cell_id({std::get<0>(current_cell_id) + j, std::get<1>(current_cell_id) + k, std::get<2>(current_cell_id) + l});
-                                this->neighbouring_cell_lists[i].push_back(this->pos_to_linear_cell_id({std::get<0>(cell_id) + j, std::get<1>(cell_id) + k, std::get<2>(cell_id) + l}));
+            // Initialize the empty cell lists, the cell positions, neighbouring cells 
+            this->cell_lists = std::vector<std::vector<int>>(this->no_cells_ghosts, std::vector<int>());
+            this->cell_list_particle_no = std::vector<int>;        
 
-                            }
-                        }
-                    }
-                    
-                }
-            }
+            // Initialize the empty positions and velocity arrays of size no_particles
+            this->positions = std::vector<std::array<double, 3>>(this->no_particles, {0.0, 0.0, 0.0});
+            this->velocities = std::vector<std::array<double, 3>>(this->no_particles, {0.0, 0.0, 0.0});
+
+            // Initialize the local - global particle mappings
+            this->local_global_particle_ids_map = std::map<int, int>();
+            this->global_local_particle_ids_map = std::map<int, int>();
+
+            this->global_local_ghost_particle_ids_map = std::map<int, int>();
+            this->local_global_ghost_particle_ids_map = std::map<int, int>();
+
+            // Initialize the neighbouring subdomains
+            this->neighbouring_subdomains = std::array<int, 6>(0);
+
+            // Initialize the removal queue
+            this->removal_queue = std::queue<int>;
 
         }
+
+        void parameter_setup(){
+            // Setup midpoints
+            this->midpoint = std::array<double, 3>({this->bounds[0] + this->side_length/2.0, this->bounds[2] + this->side_length/2.0, this->bounds[4] + this->side_length/2.0});
+
+        }
+
+
         void build_cell_lists(){
-            // Build the cell lists from the previous cell lists
-            // Iterate over the particles
-            int lid;
-            for (int i = 0; i < this->no_particles; i++){
-                lid = this->pos_to_linear_cell_id(this->positions[i]);
-            }
-        }
-
-        void init_cell_lists(){
             // Initialize the cell lists id for each particle, count number of particles in each cell and build cell lists
-            // Initialize an empty int vector
-            // Cell lists are built from the original positions array passed from configuration
-            
+            // Include in domain particles
             int lid = 0; 
             for (int i = 0; i < this->no_particles; i++){
                 lid = this->pos_to_linear_cell_id(this->positions[i]);
                 this->cell_list_particle_no[lid] += 1;
-                this->cell_list_id[i] = lid;
                 this->cell_lists[lid].push_back(i);
             }
-
         }
 
         int pos_to_linear_cell_id(std::array<double, 3> pos){
@@ -395,29 +328,26 @@ class ProcessorSubdomain{
             int i = int(px*this->no_subdivisions);
             int j = int(py*this->no_subdivisions);
             int k = int(pz*this->no_subdivisions);
-            int n = this->no_cells;
 
-            return n*(k + n*(j + n*i));
+            return this->no_cells*(k + this->no_cells*(j + this->no_cells*i));
         }
         }
         // ---------------------------------- Neighbor list initialization and management --------------------------------
         {
-        void init_neighbour_list(){
-            // Initialize the empty neighbour list
-            this->neighbour_list = std::vector<ij_pair>(this->no_particles, 0);
-        }
-
-        void check_neighbours(const std::vector<int>& particle_ids1, const std::vector<int>& particle_ids2){
+        void check_add_neighbours(const std::vector<int>& cell_ids1, 
+                              const std::vector<int>& cell_ids2, 
+                              const std::vector<std::array<int, 3>>& positions1,
+                              const std::vector<std::array<int, 3>>& positions2){
             // Given the ids in the cell lists of two particles, check if there are any neighbours and if so add them to the neighbour list
             std::array<double, 3> pos1;
             std::array<double, 3> pos2;
             double dist_squared;
             // Iterate over each particle in the array
-            for (int i = 0; i < particle_ids1.size(); i++){
-                pos1 = this->positions[particle_ids1[i]];
+            for (int i = 0; i < cell_ids1.size(); i++){
+                pos1 = this->positions1[cell_ids1[i]];
                 // Iterate over each particle in the other array
-                for (int j = 0; j < particle_ids2.size(); j++){
-                    pos2 = this->positions[particle_ids2[j]];
+                for (int j = 0; j < cell_ids2.size(); j++){
+                    pos2 = this->positions2[cell_ids2[j]];
                     dist_squared = (pos1[0] - pos2[0])*(pos1[0] - pos2[0]) + 
                                    (pos1[1] - pos2[1])*(pos1[1] - pos2[1]) + 
                                    (pos1[2] - pos2[2])*(pos1[2] - pos2[2]);
@@ -434,17 +364,50 @@ class ProcessorSubdomain{
         void build_neighbour_lists(){
             // Build the neighbour lists for each particle, based on in and out of subdomain particles
             // Iterate over each cell, and then over each particle in the cell
+            int j;
             for (int i = 0; i < this->no_cells; i++){
                 // In cell particle neighbour
-                check_neighbours(this->cell_lists[i], this->cell_lists[i]);
-                // Out of cell neighbours, iterate over the neighbouring cells that are of increasing i, j, k
-                for (int j : neighbouring_cell_lists[i]){
-                    check_neighbours(this->cell_lists[neighbouring_cell_lists[i][j]], this->cell_lists[i]);
-                }
+                check_add_neighbours(this->cell_lists[i], this->cell_lists[i]);
+
+                // Out of cell neighbours, iterate over the neighbouring cells
+                // Make use of a half template
+                j = ijk_to_lid(i+1, j, k);
+                check_add_neighbours(this->cell_lists[neighbouring_cell_lists[i][j]], this->cell_lists[i], this->positions, this->positions);
+
+                j = ijk_to_lid(i, j+1, k);
+                check_add_neighbours(this->cell_lists[neighbouring_cell_lists[i][j]], this->cell_lists[i], this->positions, this->positions);
+
+                j = ijk_to_lid(i, j, k+1);
+                check_add_neighbours(this->cell_lists[neighbouring_cell_lists[i][j]], this->cell_lists[i], this->positions, this->positions);
+
+                j = ijk_to_lid(i+1, j+1, k);
+                check_add_neighbours(this->cell_lists[neighbouring_cell_lists[i][j]], this->cell_lists[i], this->positions, this->positions);
+
+                j = ijk_to_lid(i+1, j, k+1);
+                check_add_neighbours(this->cell_lists[neighbouring_cell_lists[i][j]], this->cell_lists[i], this->positions, this->positions);
+
+                j = ijk_to_lid(i, j+1, k+1);
+                check_add_neighbours(this->cell_lists[neighbouring_cell_lists[i][j]], this->cell_lists[i], this->positions, this->positions);
+
+                j = ijk_to_lid(i+1, j+1, k+1);
+                check_add_neighbours(this->cell_lists[neighbouring_cell_lists[i][j]], this->cell_lists[i], this->positions, this->positions);
+                
             }
         }
 
+        int ijk_to_lid(int i, int j, int k){
+            return this->no_cells*(k + this->no_cells*(j + this->no_cells*i));
         }
+
+        }
+        // ----------------------------------- Ghost particles -----------------------------------
+        {
+
+
+
+
+        }
+
         //----------------------------------- Force calculations -----------------------------------
         {
         void force_sweep(){
@@ -461,6 +424,7 @@ class ProcessorSubdomain{
             int p2; 
             std::array<double, 3> pos1;
             std::array<double, 3> pos2;
+
             std::array<double, 3> force;
             // Sweep over the subdomain neighbour list (including ghost particles)
             for (int i = 0; i < this->neighbour_lists.size(); i++){
@@ -471,13 +435,17 @@ class ProcessorSubdomain{
                 force = this->force_function(pos1, pos2);
 
                 // Add the force and its opposite to the other particle
-                this->forces[p1][0] += force[0];
-                this->forces[p1][1] += force[1];
-                this->forces[p1][2] += force[2];
+                if (p1<this->no_local_particles){
+                    this->forces[p1][0] += force[0];
+                    this->forces[p1][1] += force[1];
+                    this->forces[p1][2] += force[2];
+                }
 
-                this->forces[p2][0] -= force[0];
-                this->forces[p2][1] -= force[1];
-                this->forces[p2][2] -= force[2];
+                if (p2<this->no_local_particles){
+                    this->forces[p2][0] -= force[0];
+                    this->forces[p2][1] -= force[1];
+                    this->forces[p2][2] -= force[2];
+                }
                 
             }
         }
@@ -536,74 +504,242 @@ class ProcessorSubdomain{
         }
         }
         // ------------------------------ Time integration -------------------------------
+        {
         void update_positions(double dt){
             // Verlet integrate the positions
-            for (int i = 0; i < this->no_particles; i++){
+            for (int i = 0; i < this->no_local_particles; i++){
                 this->positions[i][0] += this->velocities[i][0] * dt + 0.5 * this->forces[i][0]/this->mass * dt * dt;
                 this->positions[i][1] += this->velocities[i][1] * dt + 0.5 * this->forces[i][1]/this->mass * dt * dt;
                 this->positions[i][1] += this->velocities[i][2] * dt + 0.5 * this->forces[i][2]/this->mass * dt * dt;
             }
         }
-        // ------------------------------ Communication -------------------------------
-        void unpack_ghost_particles(){
-            // Unpack a subdomain's ghost particles into the cell lists
-            // Messages are vector of IDPOSITION structs
-            // Read the messages in the communication object
-            // Iterate over neighbouring subdomains
-            int3double idpos;
-            int local_id; 
-            int global_id; 
-            for (int j : this->neighbouring_subdomains){
-                // Iterate over the message array, read the id and position and set the elements of the position array based on the global id
-                for (int k = 0; k < this->communication.get_forward_communication_data(this->subdomain_id, j).size(); k++){
-                    idpos = this->communication.get_forward_communication_data(this->subdomain_id, j)[k];
-                    
-                }
-            }
-            // Add the ghost particles to the cell lists
         }
 
+
+        // ------------------------------ Communication -------------------------------
+        {
+
+        // Ghost lambda functions in x, y, z directions
+        auto chghost_dir = [] (double r, double l, double u) {return (r > l && r < u); };
+        void unpack_ghost_particles() {
+            // Unpack a subdomain's ghost particles: editing particle positions, adding ghost particles and removing ghost particles
+            // Messages are vectors of IDPOSITION structs
+            // Iterate over neighbouring subdomains
+            // TODO: Clear ghost buffer
+
+            int3double idpos;
+            bool new_particle = false;
+            int local_id;
+            int global_id;
+
+            // Iterate over the neighboring subdomains
+            for (int j : this->neighbouring_subdomains) {
+                // Get the communication data for the current neighboring subdomain
+                const auto& comm_data = this->communication.get_forward_communication_data(this->subdomain_id, j);
+
+                // Check if there are any ghost particles to unpack
+                if (!comm_data.empty()) {
+                    // Iterate over the ghost particles in the communication data
+                    for (const auto& idpos : comm_data) {
+                        global_id = idpos.first;
+                        const auto& position = idpos.second;
+
+                        // Check if the global ID is in the global-to-local particle ID map
+                        auto it = this->global_local_particle_ids_map.find(global_id);
+                        if (it != this->global_local_particle_ids_map.end()) {
+                            // Particle already exists, update its position
+                            local_id = it->second;
+                            this->positions[local_id] = position;
+                        } else {
+                            // New particle, buffer it into the ghost particle queue
+                            this->ghost_buffer_ids.push_back(global_id);
+                            this->ghost_buffer_positions.push_back(position);
+                            new_particle = true;
+                        }
+                    }
+                }
+            }
+
+            if (new_particle) {
+                // Incorporate the ghost buffer IDs into the global map
+                for (int i = 0; i < this->ghost_buffer_ids.size(); ++i) {
+                    int new_local_id = this->no_particles + i;
+                    this->global_local_particle_ids_map[this->ghost_buffer_ids[i]] = new_local_id;
+                    this->local_global_particle_ids_map[new_local_id] = this->ghost_buffer_ids[i];
+                }
+
+                // Incorporate the ghost buffer positions into the position array
+                this->positions.insert(this->positions.end(), this->ghost_buffer_positions.begin(), this->ghost_buffer_positions.end());
+
+                // Clear ghost buffers
+                this->ghost_buffer_ids.clear();
+                this->ghost_buffer_positions.clear();
+            }
+        }
+
+
+        void add_ghost_particles(){
+        // Add the queued ghost particles to the 
+        }
+
+        void pack_ghost_particles() {
+            // Pack this subdomain's ghost particles into messages to its neighbouring subdomains
+            // Check if particles are in the correct part of the positions array
+            // Clear the communication arrays
+            for (int i = 0; i < 6; i++) {
+                this->forward_communication_data[i].clear();
+            }
+
+            // Accumulate the ghost particles in the communication arrays
+            int3double idpos;
+            bool lx, ux, ly, uy, lz, uz;
+            for (int i = 0; i < this->no_local_particles; i++) {
+                // Check for ghost particles in each direction and pack them accordingly. 
+                // Particles that have moved into another subdomain are communicated here   
+
+                // Check if the particle is near the lower x-boundary
+                lx = position[i][0] < this->xl + this->cell_length;
+                if (lx) {
+                    // Check if the particle has exited the subdomain
+                    lx = position[i][0] < this->xl;
+                    if (lx) {
+                        // Queue the removal of the particle
+                        this->removal_queue.push_back(i);
+                    }
+                    idpos = int3double(i, {this->position[i][0], this->position[i][1], this->position[i][2]});
+                    this->forward_communication_data[0].push_back(idpos); // Index 0 needs to be changed accordingly
+                }
+
+                // Check if the particle is near the upper x-boundary
+                ux = position[i][0] > this->xu - this->cell_length;
+                if (ux) {
+                    // Check if the particle has exited the subdomain
+                    ux = position[i][0] > this->xu;
+                    if (ux) {
+                        // Queue the removal of the particle
+                        this->removal_queue.push_back(i);
+                    }
+                    idpos = int3double(i, {this->position[i][0], this->position[i][1], this->position[i][2]});
+                    this->forward_communication_data[1].push_back(idpos); // Index 1 needs to be changed accordingly
+                }
+
+                // Check if the particle is near the lower y-boundary
+                ly = position[i][1] < this->yl + this->cell_length;
+                if (ly) {
+                    // Check if the particle has exited the subdomain
+                    ly = position[i][1] < this->yl;
+                    if (ly) {
+                        // Queue the removal of the particle
+                        this->removal_queue.push_back(i);
+                    }
+                    idpos = int3double(i, {this->position[i][0], this->position[i][1], this->position[i][2]});
+                    this->forward_communication_data[2].push_back(idpos); // Index 2 needs to be changed accordingly
+                }
+
+                // Check if the particle is near the upper y-boundary
+                uy = position[i][1] > this->yu - this->cell_length;
+                if (uy) {
+                    // Check if the particle has exited the subdomain
+                    uy = position[i][1] > this->yu;
+                    if (uy) {
+                        // Queue the removal of the particle
+                        this->removal_queue.push_back(i);
+                    }
+                    idpos = int3double(i, {this->position[i][0], this->position[i][1], this->position[i][2]});
+                    this->forward_communication_data[3].push_back(idpos); // Index 3 needs to be changed accordingly
+                }
+
+                // Check if the particle is near the lower z-boundary
+                lz = position[i][2] < this->zl + this->cell_length;
+                if (lz) {
+                    // Check if the particle has exited the subdomain
+                    lz = position[i][2] < this->zl;
+                    if (lz) {
+                        // Queue the removal of the particle
+                        this->removal_queue.push_back(i);
+                    }
+                    idpos = int3double(i, {this->position[i][0], this->position[i][1], this->position[i][2]});
+                    this->forward_communication_data[4].push_back(idpos); // Index 4 needs to be changed accordingly
+                }
+
+                // Check if the particle is near the upper z-boundary
+                uz = position[i][2] > this->zu - this->cell_length;
+                if (uz) {
+                    // Check if the particle has exited the subdomain
+                    uz = position[i][2] > this->zu;
+                    if (uz) {
+                        // Queue the removal of the particle
+                        this->removal_queue.push_back(i);
+                    }
+                    idpos = int3double(i, {this->position[i][0], this->position[i][1], this->position[i][2]});
+                    this->forward_communication_data[5].push_back(idpos); // Index 5 needs to be changed accordingly
+                }
+            }
+        }
+        void communicate_ghost_particles(){
+            // Communicate the ghost particles to neighboring subdomains
+            for (int i = 0; i < 6; i++){
+                this->communication->set_forward_communication_data(this->subdomain_id, this->neighbouring_subdomains[i],  this->forward_communication_data[i]);
+            }
+        }
+        }
+
+
         // ------------------------------ Auxillary functions -------------------------------
-        void particle_no_tracking() {
-            // Track the number of particles and ghost particles in this subdomain
+        {
+        void particle_tracking() {
+            // Track the number of local particles and ghost particles in this subdomain
+            // Track if particles need to be forward communicated
             int no_ghost_particles = 0;
             int n = this->no_subdivisions;
 
             // Iterate over the ghost cells and add up all the ghost particles
             // Ghost cells are at the edges of the simulation box
 
-            // Iterate over the cells on the i-plane (along z-axis, x and y vary)
-            for (int i = 0; i < n; i++) {
-                for (int j = 0; j < n; j++) {
-                    no_ghost_particles += this->cell_list_particle_no[this->pos_to_linear_cell_id({i, j, 0})];
-                    no_ghost_particles += this->cell_list_particle_no[this->pos_to_linear_cell_id({i, j, n-1})];
+            this->no_particles = this->positions.size();
+            this->no_ghost_particles = 0;
+            this->no_local_particles = 0;
+            double max_dist;
+            for (int i = 0; i < this->no_particles; i++) {
+                max_dist = std::max(std::abs(this->positions[i][0] - this->midpoint[0]), 
+                                    std::abs(this->positions[i][1] - this->midpoint[1]), 
+                                    std::abs(this->positions[i][2] - this->midpoint[2]));
+                if (max_dist > (this->side_length-this->cell_length)/2.0) {
+                    // Potentially outside the domain
+                    if (max_dist > this->side_length/2.0) {
+                        // Outside the domain -> communicate
+                    else {
+                        // Ghost particle
+                        this->no_ghost_particles += 1;
+                        }
+                    }
                 }
             }
+        }
 
-            // Iterate over the cells on the j-plane (along y-axis, x and z vary)
-            for (int i = 0; i < n; i++) {
-                for (int k = 1; k < n-1; k++) { // Skip the corners already counted in the i-plane loop
-                    no_ghost_particles += this->cell_list_particle_no[this->pos_to_linear_cell_id({i, 0, k})];
-                    no_ghost_particles += this->cell_list_particle_no[this->pos_to_linear_cell_id({i, n-1, k})];
-                }
-            }
-
-            // Iterate over the cells on the k-plane (along x-axis, y and z vary)
-            for (int j = 1; j < n-1; j++) { // Skip the corners already counted in the i-plane loop
-                for (int k = 1; k < n-1; k++) { // Skip the edges already counted in the j-plane loop
-                    no_ghost_particles += this->cell_list_particle_no[this->pos_to_linear_cell_id({0, j, k})];
-                    no_ghost_particles += this->cell_list_particle_no[this->pos_to_linear_cell_id({n-1, j, k})];
-                }
-            }
-
-
-            // Set these
-            this->no_ghost_particles = no_ghost_particles;
-            this->no_particles = this->positions.size() - this->no_ghost_particles;
-
+        void remove_particles() {
+            // Based on the removal queue, remove the particles from the subdomain, i.e : 
+            // - Remove the particles from the position vector
+            // - Remove the particles from the particle ID map
+            // - Remove the particles from the neighbour lists
 
         }
 
+        void check_position_integrity(){
+            // Check and potentially reorder the position array such that local and ghost particles are in the correct order
+            // Iterate over all particles, check if they are in the correct order
 
-}
+            for (int i = 0; i < this->no_particles; i++){
+
+
+
+
+
+            }
+        }
+
+
+
+
+        }
 
