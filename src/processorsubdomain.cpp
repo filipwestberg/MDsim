@@ -545,6 +545,9 @@ class ProcessorSubdomain{
             }
 
         }
+        void _add_particle_(int global_id, std::array<double, 3> position, auto& lg_map, auto& gl_map){
+            
+        }
         void _add_ghost_particle_(int global_id, std::array<double, 3> position){
             // Add the given ghost particle to the subdomain
             this->positions.push_back(position);
@@ -554,14 +557,19 @@ class ProcessorSubdomain{
             this->local_global_ghost_particle_ids_map[local_id] = global_id;
             // Add it to the removal map
             this->ghost_removal_map[local_id] = false; 
+            this->no_ghost_particles++;
+            this->no_particles++;
         }
         void _add_domain_particle_(int global_id, std::array<double, 3> position){
-            // Add the given particle to the subdomain
+            // Add the given particle to the end of the position array, then exchange it to for the first ghost particle
             this->positions.push_back(position);
             // New local id 
             int local_id = this->positions.size()-1;
             this->global_local_particle_ids_map[global_id] = local_id;
             this->local_global_particle_ids_map[local_id] = global_id;
+
+            // Exchange particle
+            this->exchange_position(local_id, this->positions.size()-1, global_id, this->local_global_ghost_particle_ids_map[this->positions.size()-1], true, false);
 
         }
 
@@ -583,6 +591,10 @@ class ProcessorSubdomain{
 
         void verify_positions(){
             // Check the order of the particles in the position array
+            // During the previous integration particles may have:
+            // - moved 
+            // - been added
+
             bool in_domain;
             bool is_ghost;
             // Verify size of the position array
@@ -656,36 +668,37 @@ class ProcessorSubdomain{
             return;
         }
 
-        void exchange_position(int global_id_a, 
+        void exchange_position(int local_id_a, 
+                                int local_id_b,
+                                int global_id_a,
                                 int global_id_b, 
-                                bool local_a = false, 
-                                bool local_b = false){
+                                bool in_domain_a = false, 
+                                bool in_domain_b = false){
                                             /**
              * Exchange the positions of two particles.
              *
-             * @param particle_a the id of the first particle
-             * @param particle_b the id of the second particle
-             * @param local_a flag indicating if a is local, if not its assumed to be a ghost
-             * @param local_b flag indicating if b is local, if not its assumed to be a ghost
+             * @param local_id_a the *local* id of the first particle
+             * @param local_id_b the *local* id of the second particle
+             * @param global_id_a the *global* id of the first particle
+             * @param global_id_b the *global* id of the second particle
+             * @param in_domain_a flag indicating if a is local, if not its assumed to be a ghost
+             * @param in_domain_b flag indicating if b is local, if not its assumed to be a ghost
              */
 
-            // Exchange the positions of two particles
-            std::array<double, 3> position_a = this->positions[global_id_a];
-            std::array<double, 3> position_b = this->positions[global_id_b];
-            this->positions[global_id_a] = position_b;
-            this->positions[global_id_b] = position_a;
+            // Exchange the positions of the two particles
+            std::array<double, 3> position_a = this->positions[local_id_a];
+            std::array<double, 3> position_b = this->positions[local_id_b];
+            this->positions[local_id_a] = position_b;
+            this->positions[local_id_b] = position_a;
 
             // We now need to update the maps based on the state change of the particle
-            local_id_a = (local_a ? this->global_local_particle_ids_map : this->global_local_ghost_particle_ids_map)[global_id_a];
-            local_id_b = (local_b ? this->global_local_particle_ids_map : this->global_local_ghost_particle_ids_map)[global_id_b];
+            // Local - global map
+            (in_domain_a ? this->local_global_particle_ids_map : this->local_global_ghost_particle_ids_map)[local_id_a] = global_id_b;
+            (in_domain_b ? this->local_global_particle_ids_map : this->local_global_ghost_particle_ids_map)[local_id_b] = global_id_a;
 
-            (local_a ? this->local_global_particle_ids_map : this->local_global_ghost_particle_ids_map)[local_id_a] = global_id_b;
-            (local_b ? this->local_global_particle_ids_map : this->local_global_ghost_particle_ids_map)[local_id_a] = global_id_a;
-
-            (local_a ? this->global_local_particle_ids_map : this->global_local_ghost_particle_ids_map)[global_id_a] = local_id_a;
-            (local_b ? this->global_local_particle_ids_map : this->global_local_ghost_particle_ids_map)[global_id_b] = local_id_b;
-
-            
+            // Global - local map
+            (in_domain_a ? this->global_local_particle_ids_map : this->global_local_ghost_particle_ids_map)[global_id_a] = local_id_a;
+            (in_domain_b ? this->global_local_particle_ids_map : this->global_local_ghost_particle_ids_map)[global_id_b] = local_id_b;
             }
 
         void verify_size(){
@@ -721,6 +734,7 @@ class ProcessorSubdomain{
         // ------------------------------ Communication -------------------------------
         {
 
+
         void prepare_ghost_particles() {
             // Set the map state of the ghosts, such that we can later remove the ghost particles that have migrated out of the ghost zones
             set_map_state(false, this->ghost_removal_map);
@@ -741,45 +755,58 @@ class ProcessorSubdomain{
             }
         }
 
-        // Ghost lambda functions in x, y, z directions
-        auto chghost_dir = [] (double r, double l, double u) {return (r > l && r < u); };
+        void _unpack_ghost_particles_(int buffer_id){
+            // Unpack the ghost particles from the specified buffer id
+            // Get the communication data for the current neighboring subdomain
+            // Check if there are any ghost particles to unpack
+            if (this->communication.get_forward_communication_data_size(this->subdomain_id, buffer_id) == 0) continue;
 
-        void unpack_ghost_particles() {
-            // Unpack a subdomain's ghost particles: editing particle positions, adding ghost particles and removing ghost particles
-            // Messages are vectors of IDPOSITION structs
-            // Iterate over neighbouring subdomains
+            const auto& comm_data = this->communication.get_forward_communication_data(this->subdomain_id, buffer_id);
 
-            // Iterate over the neighboring subdomains
-            for (int j : this->neighbouring_subdomains) {
-                // Get the communication data for the current neighboring subdomain
-                // Check if there are any ghost particles to unpack
+            
+            // Iterate over the ghost particles in the communication data
+            for (const auto& particle : comm_data) {
+                int global_id = particle.first;
+                const auto& position = particle.second;
 
-                if (this->communication.get_forward_communication_data_size(this->subdomain_id, j) == 0) continue;
+                // Check if the global ID is in the global-to-local ghost particle ID map
+                auto containsID = this->global_local_ghost_particle_ids_map.contains(global_id);
+                if (containsID) {
+                    // Particle exists, update its position, set its removal map element to false
+                    int local_id = it->second;
+                    this->positions[local_id] = position;
+                    this->ghost_removal_map[local_id] = false; 
 
-                const auto& comm_data = this->communication.get_forward_communication_data(this->subdomain_id, j);
-
-                
-                // Iterate over the ghost particles in the communication data
-                for (const auto& particle : comm_data) {
-                    int global_id = particle.first;
-                    const auto& position = particle.second;
-
-                    // Check if the global ID is in the global-to-local ghost particle ID map
-                    auto containsID = this->global_local_ghost_particle_ids_map.contains(global_id);
-                    if (containsID) {
-                        // Particle exists, update its position
-                        int local_id = it->second;
-                        this->positions[local_id] = position;
-                        this->ghost_removal_map[local_id] = false; 
-                    } else {
-                        // New particle, buffer it into the ghost addition queue
-                        this->ghost_addition_queue_ids.push_back(global_id);
-                        this->ghost_addition_queue_positions.push_back(position);
-                    }
+                } else {
+                    // New particle, buffer it into the ghost addition queue
+                    this->ghost_addition_queue_ids.push_back(global_id);
+                    this->ghost_addition_queue_positions.push_back(position);
                 }
-                
             }
+
+
+            //
+
+
         }
+       
+        void unpack_ghost_particles_X() {
+            // Read the forward communication data transmitted from the neighbouring subdomains in the X direction
+            _unpack_ghost_particles_(this->neighboring_subdomains[0]);
+            _unpack_ghost_particles_(this->neighboring_subdomains[1]);
+        }
+
+        void unpack_ghost_particles_Y() {
+            // Read the forward communication data transmitted from the neighbouring subdomains in the Y direction
+            _unpack_ghost_particles_(this->neighboring_subdomains[2]);
+            _unpack_ghost_particles_(this->neighboring_subdomains[3]);
+        }
+
+        void unpack_ghost_particles_Z() {   
+            // Read the forward communication data transmitted from the neighbouring subdomains in the Z direction
+            _unpack_ghost_particles_(this->neighboring_subdomains[4]);
+            _unpack_ghost_particles_(this->neighboring_subdomains[5]);
+        }   
 
         
         void pack_ghost_particles_X(){
@@ -849,112 +876,54 @@ class ProcessorSubdomain{
             }
         }
         
-        void pack_ghost_particles() {
-            // Pack this subdomain's ghost particles into messages to its neighbouring subdomains
-            // Check if particles are in the correct part of the positions array
-            // Clear the communication arrays
-            for (int i = 0; i < 6; i++) {
-                this->forward_communication_data[i].clear();
-            }
-
-            // Accumulate the ghost particles in the communication arrays
-            int3double idpos;
-            bool lx, ux, ly, uy, lz, uz;
-            for (int i = 0; i < this->no_local_particles; i++) {
-                // Check for ghost particles in each direction and pack them accordingly. 
-                // Particles that have moved into another subdomain are communicated here   
-
-                idpos = int3double(i, {this->position[i][0], this->position[i][1], this->position[i][2]});
-
-                // Check if the particle is near the lower x-boundary
-                lx = position[i][0] < this->xl + this->cell_length;
-                if (lx) {
-                    // Check if the particle has exited the subdomain
-                    lx = position[i][0] < this->xl;
-                    if (lx) {
-                        // Queue the removal of the particle
-                        this->removal_queue.push_back(i);
-                    }
-                    this->forward_communication_data[0].push_back(idpos); // Index 0 needs to be changed accordingly
-                }
-
-                // Check if the particle is near the upper x-boundary
-                ux = position[i][0] > this->xu - this->cell_length;
-                if (ux) {
-                    // Check if the particle has exited the subdomain
-                    ux = position[i][0] > this->xu;
-                    if (ux) {
-                        // Queue the removal of the particle
-                        this->removal_queue.push_back(i);
-                    }
-                    this->forward_communication_data[1].push_back(idpos); // Index 1 needs to be changed accordingly
-                }
-
-                // Check if the particle is near the lower y-boundary
-                ly = position[i][1] < this->yl + this->cell_length;
-                if (ly) {
-                    // Check if the particle has exited the subdomain
-                    ly = position[i][1] < this->yl;
-                    if (ly) {
-                        // Queue the removal of the particle
-                        this->removal_queue.push_back(i);
-                    }
-                    this->forward_communication_data[2].push_back(idpos); // Index 2 needs to be changed accordingly
-                }
-
-                // Check if the particle is near the upper y-boundary
-                uy = position[i][1] > this->yu - this->cell_length;
-                if (uy) {
-                    // Check if the particle has exited the subdomain
-                    uy = position[i][1] > this->yu;
-                    if (uy) {
-                        // Queue the removal of the particle
-                        this->removal_queue.push_back(i);
-                    }
-                    this->forward_communication_data[3].push_back(idpos); // Index 3 needs to be changed accordingly
-                }
-
-                // Check if the particle is near the lower z-boundary
-                lz = position[i][2] < this->zl + this->cell_length;
-                if (lz) {
-                    // Check if the particle has exited the subdomain
-                    lz = position[i][2] < this->zl;
-                    if (lz) {
-                        // Queue the removal of the particle
-                        this->removal_queue.push_back(i);
-                    }
-                    this->forward_communication_data[4].push_back(idpos); // Index 4 needs to be changed accordingly
-                }
-
-                // Check if the particle is near the upper z-boundary
-                uz = position[i][2] > this->zu - this->cell_length;
-                if (uz) {
-                    // Check if the particle has exited the subdomain
-                    uz = position[i][2] > this->zu;
-                    if (uz) {
-                        // Queue the removal of the particle
-                        this->removal_queue.push_back(i);
-                    }
-                    this->forward_communication_data[5].push_back(idpos); // Index 5 needs to be changed accordingly
-                }
-            }
-        }
 
         void communicate_ghost_particles(){
             // Pack the ghost particles into message buffers for the neighbouring subdomains in order X, Y, Z
+            // TODO : Fix code duplication
             pack_ghost_particles_X();
             communicate_ghost_particles_X();
             unpack_ghost_particles_X();
+            add_ghost_particles();
 
             pack_ghost_particles_Y();
             communicate_ghost_particles_Y();
             unpack_ghost_particles_Y();
+            add_ghost_particles();
 
             pack_ghost_particles_Z();
             communicate_ghost_particles_Z();
             unpack_ghost_particles_Z();
+            add_ghost_particles();
+
+            clear_communication_data();
             
         }
+        void clear_communication_data(){
+            // Clear the communication data arrays
+            this->forward_communication_data[0].clear();
+            this->forward_communication_data[1].clear();
+            this->forward_communication_data[2].clear();
+            this->forward_communication_data[3].clear();
+            this->forward_communication_data[4].clear();
+            this->forward_communication_data[5].clear();
+        }
+
+        void communicate_ghost_particles_X(){
+            // Communicate the ghost particles in the X direction
+            this->communication.set_communication_data(this->subdomain_id, this->neighboring_subdomain[0], this->forward_communication_data[0]);
+            this->communication.set_communication_data(this->subdomain_id, this->neighboring_subdomain[1], this->forward_communication_data[1]);
+        }
+        void communicate_ghost_particles_Y(){
+            // Communicate the ghost particles in the Y direction
+            this->communication.set_communication_data(this->subdomain_id, this->neighboring_subdomain[2], this->forward_communication_data[2]);
+            this->communication.set_communication_data(this->subdomain_id, this->neighboring_subdomain[3], this->forward_communication_data[3]);
+        }
+        void communicate_ghost_particles_Z(){
+            // Communicate the ghost particles in the Z direction
+            this->communication.set_communication_data(this->subdomain_id, this->neighboring_subdomain[4], this->forward_communication_data[4]);
+            this->communication.set_communication_data(this->subdomain_id, this->neighboring_subdomain[5], this->forward_communication_data[5]);
+        }
+
         
 
         }
