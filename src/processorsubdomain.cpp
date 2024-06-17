@@ -26,6 +26,7 @@
 //          Incorporate particles shifting subdomain
 //          Exception handling
 //          Delete particle : shift the particles -> delete last element in the array to avoid having to change all local ids
+//          Hpp of the code
 
 struct int3double    
 {
@@ -77,7 +78,7 @@ class ProcessorSubdomain{
         // Misc.
         int iteration = 0; // Current iteration
         double ghost_cutoff; // Cutoff for ghost particles
-        int  neighbor_list_build_per = 5;
+        int  neighbor_list_build_period = 5;
 
         bool comm_forward; 
         Communication communication; // TODO add pointer to this shared object
@@ -88,7 +89,6 @@ class ProcessorSubdomain{
         std::vector<double> potential_parameters;
 
         // Fixed parameters
-        static const int no_contacts_per_particle = 6;  // For reservation of contact list size
         static const double dt;  // Time step 
         static const double mass; // Mass of particle
 
@@ -149,6 +149,9 @@ class ProcessorSubdomain{
         // Position array reordering
         std::vector<int> ghost_reordering_ids;
         std::vector<int> in_domain_reordering_ids;
+
+        // Particle transfer queue
+        std::queue<idpos> transfer_queue;
 
 
         ProcessorSubdomain(int processor_id, 
@@ -573,7 +576,7 @@ class ProcessorSubdomain{
 
         }
 
-        void remove_particle(int global_id){
+        void remove_in_domain_particle(int global_id){
             // Remove the given particle from the subdomain
             int local_id = this->global_local_particle_ids_map[global_id];
             this->positions.erase(this->positions.begin() + local_id);
@@ -809,78 +812,114 @@ class ProcessorSubdomain{
         }   
 
         
-        void pack_ghost_particles_X(){
-            // Pack this subdomain's ghost particles into messages to its neighbouring subdomains in the X direction
+
+        void _pack_ghost_particles_(int position_id, 
+                                 double lb, 
+                                 double ub, 
+                                int lb_id, 
+                                int ub_id) {
+            // Pack the ghost particles into the specified buffer id
             // Accumulate the ghost particles in the communication arrays
             int3double idpos;
-            bool lx, ux;
-            for (int i = 0; i < this->no_local_particles; i++) {
+            bool lrange, urange;
+
+            for (int i = 0; i < this->no_particles; i++) {
                 // Check for ghost particles in each direction and pack them accordingly. 
                 // Particles that have moved into another subdomain are communicated here   
-
                 idpos = int3double(i, this->positions[i]);
 
-                // Check if the particle is across x-boundaries
-                lx = position[i][0] < this->xl + this->cell_length;
-                ux = position[i][0] > this->xu - this->cell_length;
-                if (lx) {
-                    this->forward_communication_data[0].push_back(idpos); 
-                } else if (ux) {
-                    this->forward_communication_data[1].push_back(idpos);
+                // Check if the particle is in the ghost region and if so whether its a ghost particle and pack it accordingly
+                // Is the particle in the ghost region or *outside* of the domain?
+                lrange = (this->positions[i][position_id] < lb + this->ghost_cuttoff && this->positions[i][position_id] > lb);
+                urange = (this->positions[i][position_id] > ub - this->ghost_cuttoff && this->positions[i][position_id] < ub);
+                if (lrange) {
+                    this->forward_communication_data[lb_id].push_back(idpos); 
+                } else if (urange) {
+                    this->forward_communication_data[ub_id].push_back(idpos); 
                 }
             }
+
+        }
+
+        void pack_ghost_particles_X(){
+            // Pack this subdomain's ghost particles into messages to its neighbouring subdomains in the X direction
+            _pack_ghost_particles_(position_id = 0, lb = this->xl, ub = this->xu, lb_id = 0, ub_id = 1);
         }
 
         void pack_ghost_particles_Y(){
             // Pack this subdomain's ghost particles into messages to its neighbouring subdomains in the Y direction
             // Here we iterate over all particles in the subdomain, including the ghost particles accumulated during the X - step
-            // Accumulate the ghost particles in the communication arrays
-            int3double idpos;
-            bool ly, uy;
-            for (int i = 0; i < this->no_particles; i++) {
-                // Check for ghost particles in each direction and pack them accordingly. 
-                // Particles that have moved into another subdomain are communicated here   
-
-                idpos = int3double(i, this->positions[i]);
-                // Check if the particle is across y-boundaries - these are not bounded from one direction, then *including previous ghost particles*.
-                ly = position[i][0] < this->yl + this->cell_length;
-                uy = position[i][0] > this->yu - this->cell_length;
-                if (ly) {
-                    this->forward_communication_data[2].push_back(idpos); 
-                } else if (uy) {
-                    this->forward_communication_data[3].push_back(idpos);
-                }
-            }
+            _pack_ghost_particles_(position_id = 1, lb = this->yl, ub = this->yu, lb_id = 2, ub_id = 3);
         }
 
         void pack_ghost_particles_Z(){
             // Pack this subdomain's ghost particles into messages to its neighbouring subdomains in the Z direction
             // Here we iterate over all particles in the subdomain, including the ghost particles accumulated during the XY - steps
-            // Accumulate the ghost particles in the communication arrays
+            _pack_ghost_particles_(position_id = 2, lb = this->zl, ub = this->zu, lb_id = 4, ub_id = 5);
+        }
+
+
+
+        void _transfer_particles_(int position_id, 
+                                 double lb, 
+                                 double ub, 
+                                int lb_id, 
+                                int ub_id) {
+            // Pack the ghost particles into the specified buffer ids
+            // Accumulate the transferred particles in the communication arrays
             int3double idpos;
-            bool lz, uz;
-            for (int i = 0; i < this->no_particles; i++) {
+            bool lrange, urange;
+
+            for (int i = 0; i < this->no_local_particles; i++) {
                 // Check for ghost particles in each direction and pack them accordingly. 
                 // Particles that have moved into another subdomain are communicated here   
-
                 idpos = int3double(i, this->positions[i]);
-                // Check if the particle is across z-boundaries - these are not bounded from one direction, then *including previous ghost particles*.
-                lz = position[i][0] < this->zl + this->cell_length;
-                uz = position[i][0] > this->zu - this->cell_length;
-                if (lz) {
-                    this->forward_communication_data[4].push_back(idpos); 
-                } else if (uz) {
-                    this->forward_communication_data[5].push_back(idpos);
-                }        
-                
+
+                // Is the particle outside the domain in the specified direction?
+                lrange = (this->positions[i][position_id] < lb);
+                urange = (this->positions[i][position_id] > ub);
+                if (lrange) {
+                    this->forward_communication_data[lb_id].push_back(idpos); 
+                } else if (urange) {
+                    this->forward_communication_data[ub_id].push_back(idpos); 
+                }
             }
+
+            
         }
+
+        void transfer_particles_X(){
+            _transfer_particles_(position_id = 0, lb = this->xl, ub = this->xu, lb_id = 0, ub_id = 1);
+        }
+
+        void transfer_particles_Y(){
+            _transfer_particles_(position_id = 1, lb = this->yl, ub = this->yu, lb_id = 2, ub_id = 3);
+        }
+
+        void transfer_particles_Z(){
+            _transfer_particles_(position_id = 2, lb = this->zl, ub = this->zu, lb_id = 4, ub_id = 5);
+        }
+
+        
+
+
+        void transfer_particles(){
+            // Transfer particles that crossed boundaries to the neighbouring subdomains
+            // Transfer in steps X, Y, Z
+            transfer_particles_X();
+            unpack_transfer_particles_X();
+            transfer_particles_Y();
+            unpack_transfer_particles_Y();
+            transfer_particles_Z();
+            unpack_transfer_particles_Z();
+        }
+
         
 
         void communicate_ghost_particles(){
             // Pack the ghost particles into message buffers for the neighbouring subdomains in order X, Y, Z
             // TODO : Fix code duplication
-            pack_ghost_particles_X();
+            pack_ghost_particles_X();;
             communicate_ghost_particles_X();
             unpack_ghost_particles_X();
             add_ghost_particles();
@@ -895,7 +934,11 @@ class ProcessorSubdomain{
             unpack_ghost_particles_Z();
             add_ghost_particles();
 
+            // Clear communication data arrays, reorder the position array and remove now superfluous ghost particles and in-domain particles
             clear_communication_data();
+            order_positions();
+            remove_ghost_particles();
+            remove_in_domain_particles();
             
         }
         void clear_communication_data(){
