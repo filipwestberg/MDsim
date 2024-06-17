@@ -150,10 +150,6 @@ class ProcessorSubdomain{
         std::vector<int> ghost_reordering_ids;
         std::vector<int> in_domain_reordering_ids;
 
-        // Particle transfer queue
-        std::queue<idpos> transfer_queue;
-
-
         ProcessorSubdomain(int processor_id, 
                             int subdomain_id, 
                             int no_particles, 
@@ -203,8 +199,12 @@ class ProcessorSubdomain{
 
 
         void iterate(){
-            // Unpack ghost particles
-            this->unpack_ghost_particles();
+
+            // Transfer particles 
+            this->transfer_particles();
+
+            // Communicate and unpack ghost particles
+            this->communicate_ghost_particles();
 
             // Check the integrity of the particle positions array and reorder if necessary (former ghost particles are here made into in-domain particles)
             this->order_positions();
@@ -511,14 +511,28 @@ class ProcessorSubdomain{
         }
         // Particle removal, addition, editing
 
-        void add_ghost_particles(){
-            // Add the ghost particles to the position array, remember that they *can* be inside the domain. We fix this at a later point in the iteration.
+        void add_queued_ghost_particles(){
+            // Add the queued ghost particles to the position array if there are any
             while(!this->ghost_addition_queue.empty()){
                 // Add the ghost particles
                 const auto global_id = this->ghost_addition_queue.front().first;
                 const auto& position = this->ghost_addition_queue.front().second;
-                this->add_particle(global_id, position);
+                this->_add_ghost_particle_(global_id, position);
                 this->ghost_addition_queue.pop_front();
+            }
+        }
+
+        void add_domain_particles(int buffer_id){
+            // Add the k transferred particles to the position array by:
+            //                  1: Shuffle the first k ghost particles to the end of the array and update their mappings
+            //                  2: Add the transferred particles to the position array
+            if (this->forward_communication_data[buffer_id].empty()){
+                return;
+            }
+
+            auto& transfer_buffer = this->forward_communication_data[buffer_id];
+            for (auto idpos : transfer_buffer){ {
+                add_domain_particle(idpos.first, idpos.second);
             }
         }
 
@@ -530,54 +544,53 @@ class ProcessorSubdomain{
                 }
             }
         }
-        void remove_particle(int global_id, bool ghost = false){
-            // Remove the given particle from the subdomain
-            if (!ghost) {
-                _remove_domain_particle_(global_id);
-            } else {
-                _remove_ghost_particle_(global_id);
+        void remove_particles(){
+            // Remove the transferred particles from the position array and mappings
+            while(!this->removal_queue.empty()){
+                _remove_domain_particle_(this->removal_queue.front());
+                this->removal_queue.pop_front();
             }
+        }
 
-        }
-        void add_particle(int global_id, std::array<double, 3> position, bool ghost = false){
-            // Add the given particle to the subdomain
-            if (!ghost) {
-                _add_domain_particle_(global_id, position);
-            } else {
-                _add_ghost_particle_(global_id, position);
-            }
 
-        }
-        void _add_particle_(int global_id, std::array<double, 3> position, auto& lg_map, auto& gl_map){
-            
-        }
         void _add_ghost_particle_(int global_id, std::array<double, 3> position){
             // Add the given ghost particle to the subdomain
             this->positions.push_back(position);
+
             // New local id 
             int local_id = this->positions.size()-1;
             this->global_local_ghost_particle_ids_map[global_id] = local_id;
             this->local_global_ghost_particle_ids_map[local_id] = global_id;
+
             // Add it to the removal map
             this->ghost_removal_map[local_id] = false; 
+
+            // We add to the ghost and total particle counters
             this->no_ghost_particles++;
             this->no_particles++;
         }
+
         void _add_domain_particle_(int global_id, std::array<double, 3> position){
-            // Add the given particle to the end of the position array, then exchange it to for the first ghost particle
-            this->positions.push_back(position);
-            // New local id 
-            int local_id = this->positions.size()-1;
-            this->global_local_particle_ids_map[global_id] = local_id;
-            this->local_global_particle_ids_map[local_id] = global_id;
+            // Shuffle the first ghost particle to the end of the array
+            this->positions.push_back(this->positions[this->no_local_particles]);
+            // Update its local id in the mappings
+            this->local_global_ghost_particle_ids_map[this->no_particles-1] = global_id;
+            this->global_local_ghost_particle_ids_map[global_id] = this->no_particles-1;
 
-            // Exchange particle
-            this->exchange_position(local_id, this->positions.size()-1, global_id, this->local_global_ghost_particle_ids_map[this->positions.size()-1], true, false);
+            // Now insert the added particle
+            this->positions[this->no_local_particles] = position;
+            this->global_local_particle_ids_map[global_id] = this->no_local_particles;
+            this->local_global_particle_ids_map[this->no_local_particles] = global_id;
 
+            // We add to the local and total particle counters
+            this->no_local_particles++;
+            this->no_particles++;
+            this->no_particles++;
         }
 
-        void remove_in_domain_particle(int global_id){
-            // Remove the given particle from the subdomain
+        void _remove_particle(int global_id){
+            // Remove the given in-domain particle from the subdomain by:
+            //                  1. 
             int local_id = this->global_local_particle_ids_map[global_id];
             this->positions.erase(this->positions.begin() + local_id);
             this->global_local_particle_ids_map.erase(global_id);
@@ -760,10 +773,9 @@ class ProcessorSubdomain{
 
         void _unpack_ghost_particles_(int buffer_id){
             // Unpack the ghost particles from the specified buffer id
-            // Get the communication data for the current neighboring subdomain
             // Check if there are any ghost particles to unpack
             if (this->communication.get_forward_communication_data_size(this->subdomain_id, buffer_id) == 0) continue;
-
+            // Get the communication data for the current neighboring subdomain
             const auto& comm_data = this->communication.get_forward_communication_data(this->subdomain_id, buffer_id);
 
             
@@ -775,22 +787,16 @@ class ProcessorSubdomain{
                 // Check if the global ID is in the global-to-local ghost particle ID map
                 auto containsID = this->global_local_ghost_particle_ids_map.contains(global_id);
                 if (containsID) {
-                    // Particle exists, update its position, set its removal map element to false
+                    // Particle exists as ghost, update its position, set its removal map element to false
                     int local_id = it->second;
                     this->positions[local_id] = position;
                     this->ghost_removal_map[local_id] = false; 
 
                 } else {
                     // New particle, buffer it into the ghost addition queue
-                    this->ghost_addition_queue_ids.push_back(global_id);
-                    this->ghost_addition_queue_positions.push_back(position);
+                    this->ghost_addition_queue.push_back({global_id, position});
                 }
             }
-
-
-            //
-
-
         }
        
         void unpack_ghost_particles_X() {
@@ -880,12 +886,12 @@ class ProcessorSubdomain{
                 urange = (this->positions[i][position_id] > ub);
                 if (lrange) {
                     this->forward_communication_data[lb_id].push_back(idpos); 
+                    this->removal_queue.push_back(idpos.first);
                 } else if (urange) {
                     this->forward_communication_data[ub_id].push_back(idpos); 
+                    this->removal_queue.push_back(idpos.first);
                 }
             }
-
-            
         }
 
         void transfer_particles_X(){
@@ -900,7 +906,30 @@ class ProcessorSubdomain{
             _transfer_particles_(position_id = 2, lb = this->zl, ub = this->zu, lb_id = 4, ub_id = 5);
         }
 
-        
+
+        _unpack_transfer_particles_(int buffer_id){
+            // Read the forward communication data transmitted from the neighbouring subdomains
+            // Unpack the ghost particles into the specified buffer id
+            // Remove the transferred particles from the communication arrays
+            if (this->communication.get_forward_communication_data_size(this->subdomain_id, buffer_id) == 0) continue;
+            const auto& comm_data = this->communication.get_forward_communication_data(this->subdomain_id, buffer_id);
+            this->add_particles(comm_data);
+        }
+
+        void unpack_transfer_particles_X(){
+            _unpack_transfer_particles_(this->neighbouring_subdomains[0]);
+            _unpack_transfer_particles_(this->neighbouring_subdomains[1]);
+        }
+
+        void unpack_transfer_particles_Y(){
+            _unpack_transfer_particles_(this->neighbouring_subdomains[2]);
+            _unpack_transfer_particles_(this->neighbouring_subdomains[3]);
+        }
+
+        void unpack_transfer_particles_Z(){
+            _unpack_transfer_particles_(this->neighbouring_subdomains[4]);
+            _unpack_transfer_particles_(this->neighbouring_subdomains[5]);
+        }
 
 
         void transfer_particles(){
@@ -912,6 +941,9 @@ class ProcessorSubdomain{
             unpack_transfer_particles_Y();
             transfer_particles_Z();
             unpack_transfer_particles_Z();
+
+            // Clear communication data arrays
+            clear_communication_data();
         }
 
         
@@ -922,17 +954,17 @@ class ProcessorSubdomain{
             pack_ghost_particles_X();;
             communicate_ghost_particles_X();
             unpack_ghost_particles_X();
-            add_ghost_particles();
+            add_queued_ghost_particles();
 
             pack_ghost_particles_Y();
             communicate_ghost_particles_Y();
             unpack_ghost_particles_Y();
-            add_ghost_particles();
+            add_queued_ghost_particles();
 
             pack_ghost_particles_Z();
             communicate_ghost_particles_Z();
             unpack_ghost_particles_Z();
-            add_ghost_particles();
+            add_queued_ghost_particles();
 
             // Clear communication data arrays, reorder the position array and remove now superfluous ghost particles and in-domain particles
             clear_communication_data();
@@ -941,14 +973,19 @@ class ProcessorSubdomain{
             remove_in_domain_particles();
             
         }
+
         void clear_communication_data(){
-            // Clear the communication data arrays
+            // Clear the communication data arrays here and in the communication object
             this->forward_communication_data[0].clear();
             this->forward_communication_data[1].clear();
             this->forward_communication_data[2].clear();
             this->forward_communication_data[3].clear();
             this->forward_communication_data[4].clear();
             this->forward_communication_data[5].clear();
+
+            for (int j : this->neighboring_subdomain) {
+                this->communication.clear_forward_communication_data(this->subdomain_id, j);
+            }
         }
 
         void communicate_ghost_particles_X(){

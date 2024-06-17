@@ -74,12 +74,19 @@ public:
     int get_backward_communication_data_size(int subdomain_id, int neighbouring_subdomain_id) const {
         return backward_communication_data[subdomain_id][neighbouring_subdomain_id].size();
     }
-    
+
     void set_new_particle_nos(int subdomain_id, int new_particle_no) {
         new_particle_nos[subdomain_id] = new_particle_no;
     }
     int get_new_particle_nos(int subdomain_id) const {
         return new_particle_nos[subdomain_id];
+    }
+
+    void clear_forward_communication_data(int subdomain_id, int neighbouring_subdomain_id) {
+        forward_communication_data[subdomain_id][neighbouring_subdomain_id].clear();
+    }
+    void clear_backward_communication_data(int subdomain_id, int neighbouring_subdomain_id) {
+        backward_communication_data[subdomain_id][neighbouring_subdomain_id].clear();
     }
 
 };
