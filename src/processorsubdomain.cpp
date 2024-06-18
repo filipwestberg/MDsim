@@ -79,6 +79,7 @@ class ProcessorSubdomain{
         int iteration = 0; // Current iteration
         double ghost_cutoff; // Cutoff for ghost particles
         int  neighbor_list_build_period = 5;
+        double skin = 0.0;
 
         bool comm_forward; 
         Communication communication; // TODO add pointer to this shared object
@@ -299,6 +300,37 @@ class ProcessorSubdomain{
             }
         }
 
+        void sort_from_cells(){
+            // Sort the position array based on the cell id, such that the particles in the same cell are next to each other in the array
+            // We already know the number of particles in each cell, defining a cumulative offset for all cells
+            // Call after building the cell lists, they become invalid after iteration!
+
+            std::vector<int> cumulative_offsets = this->cumulative_offset();
+            // Create a copy of the positions array
+            std::vector<std::array<double, 3>> positions_copy = this->positions;
+            int local_particle_id;
+            int new_local_particle_id;
+            for (int i = 0; i < this->no_cells_ghosts; i++){
+                for (int j = 0; j < this->cell_list_particle_no[i]; j++){
+                    local_particle_id = this->cell_lists[i][j];
+                    new_local_particle_id = cumulative_offsets[i] + j;
+                    this->positions[new_local_particle_id] = positions_copy[local_particle_id];
+                    // Change the local particle id in the cell lists
+                    this->cell_lists[i][j] = new_local_particle_id;
+                };
+            }
+
+        }
+
+        std::vector<int> cumulative_offset(){
+            // Get the cumulative offset of the number of particles in each cell
+            std::vector<int> offset(this->no_cells_ghosts, 0);
+            for (int i = 1; i < this->no_cells_ghosts; i++){
+                offset[i] = offset[i-1] + this->cell_list_particle_no[i-1];
+            }
+            return offset;
+        }
+
         int pos_to_linear_cell_id(std::array<double, 3> pos){
             /**
              * Converts a position to a tuple of cell indices.
@@ -358,35 +390,29 @@ class ProcessorSubdomain{
 
         void build_neighbour_lists(){
             // Build the neighbour lists for each particle, based on in and out of subdomain particles
-            // Iterate over each cell, and then over each particle in the cell
+            // Start by building the cell lists
+            build_cell_lists();
+            // Sort the position array based on the cell lists
+            sort_from_cells();
+            // Now to build neighbour lists, iterate over each cell, and then over each particle in the cell
             int j;
             for (int i = 0; i < this->no_cells; i++){
                 // In cell particle neighbour
                 check_add_neighbours(this->cell_lists[i], this->cell_lists[i]);
 
                 // Out of cell neighbours, iterate over the neighbouring cells
-                // Make use of a half template
-                j = ijk_to_lid(i+1, j, k);
-                check_add_neighbours(this->cell_lists[neighbouring_cell_lists[i][j]], this->cell_lists[i], this->positions, this->positions);
-
-                j = ijk_to_lid(i, j+1, k);
-                check_add_neighbours(this->cell_lists[neighbouring_cell_lists[i][j]], this->cell_lists[i], this->positions, this->positions);
-
-                j = ijk_to_lid(i, j, k+1);
-                check_add_neighbours(this->cell_lists[neighbouring_cell_lists[i][j]], this->cell_lists[i], this->positions, this->positions);
-
-                j = ijk_to_lid(i+1, j+1, k);
-                check_add_neighbours(this->cell_lists[neighbouring_cell_lists[i][j]], this->cell_lists[i], this->positions, this->positions);
-
-                j = ijk_to_lid(i+1, j, k+1);
-                check_add_neighbours(this->cell_lists[neighbouring_cell_lists[i][j]], this->cell_lists[i], this->positions, this->positions);
-
-                j = ijk_to_lid(i, j+1, k+1);
-                check_add_neighbours(this->cell_lists[neighbouring_cell_lists[i][j]], this->cell_lists[i], this->positions, this->positions);
-
-                j = ijk_to_lid(i+1, j+1, k+1);
-                check_add_neighbours(this->cell_lists[neighbouring_cell_lists[i][j]], this->cell_lists[i], this->positions, this->positions);
-                
+                // 
+                for (int i = -1; i < 2; i++){
+                    for (int j = -1; j < 2; j++){
+                        for (int k = -1; k < 2; k++){
+                            if (i == 0 && j == 0 && k == 0){
+                                continue;
+                            }
+                            j = ijk_to_lid(i, j, k);
+                            check_add_neighbours(this->cell_lists[neighbouring_cell_lists[i][j]], this->cell_lists[i], this->positions, this->positions);
+                        }
+                    }
+                }
             }
         }
 
@@ -537,10 +563,11 @@ class ProcessorSubdomain{
         }
 
         void remove_ghost_particles(){
-            // Remove the ghost particles from the position array based on the removal map
+            // Remove the ghost particles from the position array based on the removal vector
             for (const auto & [global_id, state] : this->ghost_removal_map) {
                 if (state) {
                     _remove_ghost_particle_(global_id);
+                    this->ghost_removal_map[global_id] = false;
                 }
             }
         }
@@ -568,6 +595,26 @@ class ProcessorSubdomain{
             // We add to the ghost and total particle counters
             this->no_ghost_particles++;
             this->no_particles++;
+        }
+
+        void _remove_ghost_particle_(int global_id){
+
+            int local_id_del = this->global_local_ghost_particle_ids_map[global_id];
+            int global_id_move = this->local_global_ghost_particle_ids_map[this->no_ghost_particles-1];
+
+            // Shift the last ghost particle to the position of the particle to be deleted
+            this->positions[local_id_del] = this->positions[this->no_ghost_particles-1];
+
+            // Update the mapping of the moved particle
+            this->global_local_ghost_particle_ids_map[global_id_move] = local_id_del;
+            this->local_global_ghost_particle_ids_map[local_id_del] = global_id_move;
+            
+            // Delete the particle from the mappings and the ghost removal vector
+            this->global_local_ghost_particle_ids_map.erase(global_id);
+            this->local_global_ghost_particle_ids_map.erase(this->no_particles-1);
+            this->ghost_removal_map.erase(this->no_particles-1);
+            this->no_ghost_particles--;
+            this->no_particles--;
         }
 
         void _add_domain_particle_(int global_id, std::array<double, 3> position){
